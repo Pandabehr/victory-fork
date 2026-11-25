@@ -168,6 +168,55 @@ fn place_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -
     Ok(Placed { buffer, heap, gpu, bias: offset - at })
 }
 
+/// Buffers covering whole sections, as copy sources for the card's copy
+/// engine: what the engine reads title memory through when a VRAM copy
+/// is filled without the CPU. By section: the buffer and its GPU base.
+static SOURCES: Mutex<Vec<(usize, ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// A buffer covering `section` whole, and the GPU address of the
+/// section's start in it; `None` where the section cannot be opened.
+/// For GPU copy lists that read title memory with no CPU copy made.
+pub(crate) fn gpu_source(device: &ID3D12Device, section: usize) -> Option<(ID3D12Resource, u64)> {
+    {
+        let sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, buffer, gpu)) = sources.iter().find(|(s, _, _)| *s == section) {
+            return Some((buffer.clone(), *gpu));
+        }
+    }
+    let (bytes, heap) = {
+        let mut v = views();
+        let s = v.sections.iter_mut().find(|s| s.0 == section)?;
+        if !s.2 {
+            return None;
+        }
+        if s.3.is_none() {
+            s.3 = Some(open(device, From::Section(section)).ok());
+        }
+        (s.1, s.3.as_ref().and_then(|h| h.as_ref()).cloned())
+    };
+    let buffer = place(device, &heap?, 0, bytes).ok()?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    sources.retain(|(s, _, _)| *s != section);
+    sources.push((section, buffer.clone(), gpu));
+    tracing::info!(section, mb = bytes >> 20, "a section covered by one buffer for the card's copy engine");
+    Some((buffer, gpu))
+}
+
+/// The GPU address of title memory `[at, at + len)` if it is one run of
+/// one committed section (holes tolerated as in [`cover_run_tolerant`])
+/// and the covering buffer exists or is made: the buffer, the address,
+/// and the offset of `at` in the section.
+pub(crate) fn gpu_address(device: &ID3D12Device, at: usize, len: usize) -> Option<(ID3D12Resource, u64, u64)> {
+    let (section, offset) = {
+        let v = views();
+        cover_run_tolerant(&v.views, at, len)?
+    };
+    let (buffer, base) = gpu_source(device, section)?;
+    Some((buffer, base + offset, offset))
+}
+
 /// What kinds of memory placement covers (`VICTORY_INPLACE_KIND`, a bit
 /// mask: 1 windows, 2 buffers in section-backed heaps, 4 buffers in the
 /// streaming page pool's views; 7=all by default). Read-heavy memory in
