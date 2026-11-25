@@ -3706,8 +3706,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        // are read too often to stay in the PC's — unless level 3 asks to
+        // measure them in place all the same.
+        let big = cards() && size >= card_limits().0 && crate::inplace::level() < 3;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();

@@ -102,7 +102,7 @@ fn most() -> u64 {
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -131,6 +131,43 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// Opens a heap on the committed section `section` (cached in the views'
+/// registry) and places one buffer over the 64 KiB pages that hold
+/// `[offset, offset + len)` of it. The section's pages are the title's
+/// own memory, so nothing is locked in or counted against [`most`].
+fn place_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let mut v = views();
+    let Some(s) = v.sections.iter_mut().find(|s| s.0 == section) else {
+        return Err(None);
+    };
+    if !s.2 {
+        // Made reserved: the host refuses it. Counted with the turn-downs
+        // by the caller.
+        return Err(None);
+    }
+    if offset + len.max(1) > s.1 {
+        return Err(None);
+    }
+    if s.3.is_none() {
+        s.3 = Some(open(device, From::Section(section)).ok());
+        if s.3.as_ref().is_some_and(|h| h.is_some()) {
+            tracing::info!(section, mb = s.1 >> 20, "a section of the title's physical pages opened as a host heap");
+        }
+    }
+    let Some(heap) = s.3.as_ref().and_then(|h| h.as_ref()) else {
+        return Err(Some(windows::core::Error::empty()));
+    };
+    let heap = heap.clone();
+    let bytes_total = s.1;
+    drop(v);
+    let at = offset & !(K64 as u64 - 1);
+    let bytes = ((offset + len.max(1)).next_multiple_of(K64 as u64) - at).min(bytes_total - at);
+    let buffer = place(device, &heap, at, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+    Ok(Placed { buffer, heap, gpu, bias: offset - at })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -138,9 +175,50 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
+    // View memory that is one run of one committed section: the heap is
+    // the section, so what the title maps or unmapped of it changes
+    // nothing for the buffer — the physical bytes are the same ones. The
+    // runtime's remaps still let the shadow go, since which title memory
+    // they show may have changed.
+    let covered = cover(start as usize, len as usize);
+    if let Cover::Run(section, offset) = covered {
+        let host = crate::host::host()?;
+        return match place_section(&host.device, section, offset, len) {
+            Ok(placed) => {
+                let at = if window { 0 } else { 2 };
+                STATS[at].fetch_add(1, Ordering::Relaxed);
+                STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+                Some(placed)
+            }
+            Err(None) => {
+                STATS[4].fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(Some(e)) => {
+                if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title view memory not opened in place: a copy instead");
+                }
+                None
+            }
+        };
+    }
+    match covered {
+        Cover::Scattered => {
+            if STATS[8].fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::info!(start = format_args!("{start:#x}"), len, "scattered view memory not opened in place");
+            }
+            STATS[9].fetch_add(len, Ordering::Relaxed);
+        }
+        Cover::Holes => {
+            if STATS[10].fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::info!(start = format_args!("{start:#x}"), len, holes = hole_report(start as usize, len as usize), "holed view memory not opened in place");
+            }
+            STATS[11].fetch_add(len, Ordering::Relaxed);
+        }
+        Cover::None => {}
+        Cover::Run(..) => unreachable!(),
+    }
+    if covered != Cover::None {
         return None;
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
@@ -156,7 +234,10 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             Some(placed)
         }
         Err(None) => {
-            STATS[4].fetch_add(1, Ordering::Relaxed);
+            if STATS[12].fetch_add(1, Ordering::Relaxed) < 24 {
+                tracing::info!(start = format_args!("{start:#x}"), len, "private memory not opened in place");
+            }
+            STATS[13].fetch_add(len, Ordering::Relaxed);
             None
         }
         Err(Some(e)) => {
@@ -199,12 +280,18 @@ fn say() {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} scattered {} MB, {} holes {} MB, {} private {} MB, \
+         {} reserved sections, {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        s[8],
+        s[9] >> 20,
+        s[10],
+        s[11] >> 20,
+        s[12],
+        s[13] >> 20,
         s[4],
         s[5],
         s[6],
@@ -272,8 +359,11 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, whether made committed, and the heap
+    /// opened on it if one was tried (`Some(None)`: the host refused —
+    /// not asked again). The entry goes when the runtime makes a section
+    /// of the same handle again, and the heap with it.
+    sections: Vec<(usize, u64, bool, Option<Option<ID3D12Heap>>)>,
 }
 
 static VIEWS: Mutex<Views> =
@@ -289,7 +379,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     {
         let mut v = views();
         v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+        v.sections.push((section, bytes, committed, None));
     }
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
@@ -561,6 +651,35 @@ pub(crate) enum Cover {
     /// All of it is one run of one section: the section and the offset of
     /// `at` in it.
     Run(usize, u64),
+}
+
+/// TEMP DIAGNOSTIC: for a holed range, the count of 64 KiB pages by what
+/// they are in the registry and on the host: `covered` pages views hold,
+/// `gap_mapped` holes the host shows as committed memory (the registry
+/// lacks them — a bookkeeping gap), `gap_free` holes the host shows as
+/// reserved or free (the title really unmapped them).
+fn hole_report(at: usize, len: usize) -> String {
+    use mem::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let v = views();
+    let (mut covered, mut gap_mapped, mut gap_free) = (0u32, 0u32, 0u32);
+    let pages = len.div_ceil(K64).min(4096);
+    for k in 0..pages {
+        let page = at + k * K64;
+        let held = v.views.range(..=page).next_back().is_some_and(|(base, view)| *base + view.0 > page);
+        if held {
+            covered += 1;
+            continue;
+        }
+        let mut info = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        // SAFETY: a plain query of this process's memory.
+        let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n != 0 && info.State == MEM_COMMIT {
+            gap_mapped += 1;
+        } else {
+            gap_free += 1;
+        }
+    }
+    format!("{covered} covered, {gap_mapped} holes committed on the host (registry gap), {gap_free} holes really unmapped")
 }
 
 fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Cover {
@@ -1137,7 +1256,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(_, bytes, committed, _) in &v.sections {
         lines.push(format!(
             "census, a section of {} MB, {}",
             bytes >> 20,

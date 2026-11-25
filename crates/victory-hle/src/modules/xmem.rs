@@ -136,6 +136,32 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // Memory committed as it is reserved, big enough to matter: back it
+    // with a section instead, mapped over a placeholder, so the GPU side
+    // can open it in place (`victory-gpu`): the host cannot open private
+    // memory for the card at all on some drivers, and never parts of it
+    // here, while a committed section it can. The memory loses write-watch
+    // (sections cannot be watched); its copies are tracked by guards like
+    // the page pool's views.
+    let sectioned = !placeholder
+        && kind & MEM_COMMIT != 0
+        && size >= MIB
+        && std::env::var_os("VICTORY_XMEM_SECTIONS").is_none_or(|v| v != "0");
+    let at = if sectioned {
+        section_backed(base, size, kind, protect, if constrained { &mut parameter } else { std::ptr::null_mut() }, constrained)
+    } else {
+        std::ptr::null_mut()
+    };
+    if !at.is_null() {
+        tracing::info!(
+            size,
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            at = format_args!("{at:p}"),
+            "XMemVirtualAlloc backed by a section"
+        );
+        return at;
+    }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -154,15 +180,120 @@ pub extern "system" fn XMemVirtualAlloc(
         )
     };
     if base.is_null() {
-        tracing::debug!(
+        tracing::info!(
             size,
             kind = format_args!("{kind:#x}"),
             flags = format_args!("{flags:#x}"),
+            protect = format_args!("{protect:#x}"),
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
     }
     at
+}
+
+/// Backs a virtual allocation with a committed section mapped over a
+/// placeholder, so the GPU side can open it in place. Null on any failure
+/// (the caller falls back to plain memory).
+fn section_backed(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+    parameter: *mut MEM_EXTENDED_PARAMETER,
+    constrained: bool,
+) -> *mut c_void {
+    // A placeholder reservation of the whole range first: the view maps
+    // in its place, at the address the requirements constrain it to.
+    // SAFETY: as in `XMemVirtualAlloc`, plus the placeholder bits.
+    let reserved = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            base,
+            size,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            parameter,
+            constrained.into(),
+        )
+    };
+    if reserved.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: plain section creation; the failure is a null handle.
+    let section = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE | SEC_COMMIT,
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if section.is_null() {
+        // SAFETY: the reservation just made.
+        unsafe { VirtualFree(reserved, 0, MEM_RELEASE) };
+        return std::ptr::null_mut();
+    }
+    // SAFETY: replaces the placeholder with a full view of the section.
+    let view = unsafe {
+        MapViewOfFile3(
+            section,
+            GetCurrentProcess(),
+            reserved as *const c_void,
+            0,
+            size,
+            MEM_REPLACE_PLACEHOLDER,
+            protect,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if view.Value as usize != reserved as usize {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(size, %error, "section-backed virtual memory: the view failed, plain memory instead");
+        // SAFETY: our handles; the reservation outlives its section.
+        unsafe {
+            CloseHandle(section);
+            VirtualFree(reserved, 0, MEM_RELEASE);
+        }
+        return std::ptr::null_mut();
+    }
+    // Freed with the allocation: the runtime reports it as one more view
+    // of one more section, which is exactly what it is for the GPU side.
+    victory_gpu::title_memory_section(section as usize, size as u64, true);
+    victory_gpu::title_memory_view(reserved as usize, size, section as usize, 0);
+    {
+        let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
+        backed.insert(reserved as usize, (section as usize, size));
+    }
+    let _ = kind;
+    reserved
+}
+
+/// Section-backed virtual allocations by base address: the section and
+/// the size, so a free can take the view down with its section.
+static BACKED: LazyLock<Mutex<HashMap<usize, (usize, usize)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// If `address` bases a section-backed allocation: unmaps the view,
+/// closes the section and frees the reservation. False for plain memory.
+pub(crate) fn free_backed(address: *mut c_void) -> bool {
+    let Some((section, _size)) = ({
+        let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
+        backed.remove(&(address as usize))
+    }) else {
+        return false;
+    };
+    // The GPU side forgets what the range showed.
+    victory_gpu::title_memory_remapped(address as usize, _size);
+    // SAFETY: our view, section and reservation.
+    unsafe {
+        UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: address }, 0);
+        CloseHandle(section as HANDLE);
+        VirtualFree(address, 0, MEM_RELEASE);
+    }
+    true
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -318,7 +449,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            if !free_backed(address) {
+                VirtualFree(address, 0, MEM_RELEASE);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -411,24 +544,34 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
+    // A pagefile-backed section of `size` bytes. Made committed where the
+    // host can commit it: only a committed section can be opened as a host
+    // heap (`victory-gpu` in place), which is the whole point on Windows,
+    // and under Wine a committed section is a sparse file, free until
+    // touched, while committing a reserved one page by page costs a
+    // wineserver request each that scans every range committed so far.
+    // The title asks for 6.1 GiB at once, which a busy host often cannot
+    // commit (error 1450): a reserved section, its pages committed when
+    // first mapped or written, is the fallback, and memory in it stays
+    // copied as before.
     // SAFETY: plain section creation.
-    let handle = unsafe {
+    let make = |commit| unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | commit,
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
         )
     };
+    let mut handle = make(SEC_COMMIT);
+    let committed = !handle.is_null();
+    if !committed {
+        let error = std::io::Error::last_os_error();
+        tracing::info!(n, %error, "XMemAllocatePhysicalPages: not committed whole; a reserved section, copies instead of memory in place");
+        handle = make(SEC_RESERVE);
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -443,7 +586,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
