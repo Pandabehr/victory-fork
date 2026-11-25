@@ -264,6 +264,7 @@ fn section_backed(
     // of one more section, which is exactly what it is for the GPU side.
     victory_gpu::title_memory_section(section as usize, size as u64, true);
     victory_gpu::title_memory_view(reserved as usize, size, section as usize, 0);
+    victory_gpu::title_memory_heap(reserved as usize, size);
     {
         let mut backed = BACKED.lock().unwrap_or_else(|e| e.into_inner());
         backed.insert(reserved as usize, (section as usize, size));

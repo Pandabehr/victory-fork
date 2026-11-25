@@ -168,6 +168,16 @@ fn place_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -
     Ok(Placed { buffer, heap, gpu, bias: offset - at })
 }
 
+/// What kinds of memory placement covers (`VICTORY_INPLACE_KIND`, a bit
+/// mask: 1 windows, 2 buffers in section-backed heaps, 4 buffers in the
+/// streaming page pool's views; 7=all by default). Read-heavy memory in
+/// place costs the card PCIe reads in every pass where a copy would be
+/// VRAM — which kinds win is measured through this.
+fn kinds() -> u64 {
+    static KINDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KINDS.get_or_init(|| std::env::var("VICTORY_INPLACE_KIND").ok().and_then(|v| v.parse().ok()).unwrap_or(7))
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -175,13 +185,26 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory that is one run of one committed section: the heap is
-    // the section, so what the title maps or unmapped of it changes
-    // nothing for the buffer — the physical bytes are the same ones. The
-    // runtime's remaps still let the shadow go, since which title memory
-    // they show may have changed.
-    let covered = cover(start as usize, len as usize);
-    if let Cover::Run(section, offset) = covered {
+    let bit = if window {
+        1
+    } else if in_heap(start as usize) {
+        2
+    } else {
+        4
+    };
+    if kinds() & bit == 0 {
+        return None;
+    }
+    // View memory that is one run of one committed section, holes in it
+    // tolerated: the heap is the section, so what the title maps or
+    // unmapped of it changes nothing for the buffer — the physical bytes
+    // are the same ones. The runtime's remaps still let the shadow go,
+    // since which title memory they show may have changed.
+    let run = {
+        let v = views();
+        cover_run_tolerant(&v.views, start as usize, len as usize)
+    };
+    if let Some((section, offset)) = run {
         let host = crate::host::host()?;
         return match place_section(&host.device, section, offset, len) {
             Ok(placed) => {
@@ -202,6 +225,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             }
         };
     }
+    let covered = cover(start as usize, len as usize);
     match covered {
         Cover::Scattered => {
             if STATS[8].fetch_add(1, Ordering::Relaxed) < 16 {
@@ -364,6 +388,23 @@ struct Views {
     /// not asked again). The entry goes when the runtime makes a section
     /// of the same handle again, and the heap with it.
     sections: Vec<(usize, u64, bool, Option<Option<ID3D12Heap>>)>,
+}
+
+/// Section-backed virtual heaps by address range (`xmem`): memory the
+/// title commits once and keeps, unlike the streaming page pool's views.
+static HEAPS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The runtime backed a virtual allocation with a section, mapped whole
+/// at `at` ([`xmem` section-backed heaps): memory of this kind is marked
+/// so placement can tell it from the streaming page pool's views.
+pub fn title_memory_heap(at: usize, len: usize) {
+    HEAPS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+}
+
+/// Whether `at` lies in a section-backed heap (vs the page pool's views).
+fn in_heap(at: usize) -> bool {
+    let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps.range(..=at).next_back().is_some_and(|(base, len)| *base + *len > at)
 }
 
 static VIEWS: Mutex<Views> =
@@ -680,6 +721,30 @@ fn hole_report(at: usize, len: usize) -> String {
         }
     }
     format!("{covered} covered, {gap_mapped} holes committed on the host (registry gap), {gap_free} holes really unmapped")
+}
+
+/// [`cover_in`], tolerant of holes: unmapped parts of the range are
+/// skipped, and what is covered must still be one run of one section —
+/// the section offsets of the covered views, extrapolated linearly over
+/// the holes, must not differ. The holes in such a run are memory the
+/// title has not mapped: nothing reads them (the copies skip them the
+/// same way), and when the title maps them the runtime's remap lets the
+/// placed buffer go. `Some` is the section and the offset of `at` in it.
+fn cover_run_tolerant(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, u64)> {
+    let end = at + len.max(1);
+    let (&base, &(bytes, section, offset)) = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at)?;
+    let first = (section, offset + (at - base) as u64);
+    let (mut reached, mut one) = (base + bytes, true);
+    while reached < end {
+        // The next covered view in the range, over whatever holes. Views
+        // do not overlap, so it starts at or after `reached`.
+        let Some((&base, &(bytes, s, o))) = views.range(reached..end).next() else {
+            break;
+        };
+        one &= s == first.0 && o == first.1 + (base - at) as u64;
+        reached = base + bytes;
+    }
+    one.then_some(first)
 }
 
 fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Cover {
@@ -1400,6 +1465,32 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// Holes in a range do not turn a run down for placement: what is
+    /// covered must be linear in the section across the holes, nothing
+    /// more. Where the pages after a hole do not continue the run, there
+    /// is no placement.
+    #[test]
+    fn holes_in_one_run_still_place() {
+        let mut views = BTreeMap::new();
+        let at = 0x8_0000_0000usize;
+        // Two pages, a hole of two, then two more that continue the run
+        // exactly where the linear extrapolation puts them.
+        views.insert(at, (2 * K64, 9, 32 * K64 as u64));
+        views.insert(at + 4 * K64, (2 * K64, 9, 36 * K64 as u64));
+        assert_eq!(cover_run_tolerant(&views, at, 6 * K64), Some((9, 32 * K64 as u64)));
+        // No hole at all: the same answer.
+        assert_eq!(cover_run_tolerant(&views, at, 2 * K64), Some((9, 32 * K64 as u64)));
+        // The tail all holes after the covered prefix: placed by the same.
+        assert_eq!(cover_run_tolerant(&views, at + 4 * K64, 4 * K64), Some((9, 36 * K64 as u64)));
+        // Nothing covered at the start: none.
+        assert_eq!(cover_run_tolerant(&views, at + 2 * K64, 4 * K64), None);
+        // The pages after the hole from elsewhere: not one run, no place.
+        let mut scattered = BTreeMap::new();
+        scattered.insert(at, (2 * K64, 9, 32 * K64 as u64));
+        scattered.insert(at + 4 * K64, (2 * K64, 9, 40 * K64 as u64));
+        assert_eq!(cover_run_tolerant(&scattered, at, 6 * K64), None);
     }
 
     /// What the runtime forgets when memory is mapped anew.
