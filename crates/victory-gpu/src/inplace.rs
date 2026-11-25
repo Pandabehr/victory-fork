@@ -171,11 +171,20 @@ fn place_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -
 /// Buffers covering whole sections, as copy sources for the card's copy
 /// engine: what the engine reads title memory through when a VRAM copy
 /// is filled without the CPU. By section: the buffer and its GPU base.
+///
+/// Not wired into the copies yet: measured, the memcpy this would spare
+/// is a tenth of the copies' cost (the rest is the per-copy machinery),
+/// and the CPU sides of card copies are the reference the write merges
+/// diff against, so filling them is not skippable outright. The wiring
+/// belongs with the streaming-upload work Resizable BAR makes possible:
+/// title memory copied straight into the card's memory by its engine.
+#[allow(dead_code)]
 static SOURCES: Mutex<Vec<(usize, ID3D12Resource, u64)>> = Mutex::new(Vec::new());
 
 /// A buffer covering `section` whole, and the GPU address of the
 /// section's start in it; `None` where the section cannot be opened.
 /// For GPU copy lists that read title memory with no CPU copy made.
+#[allow(dead_code)]
 pub(crate) fn gpu_source(device: &ID3D12Device, section: usize) -> Option<(ID3D12Resource, u64)> {
     {
         let sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,6 +217,7 @@ pub(crate) fn gpu_source(device: &ID3D12Device, section: usize) -> Option<(ID3D1
 /// one committed section (holes tolerated as in [`cover_run_tolerant`])
 /// and the covering buffer exists or is made: the buffer, the address,
 /// and the offset of `at` in the section.
+#[allow(dead_code)]
 pub(crate) fn gpu_address(device: &ID3D12Device, at: usize, len: usize) -> Option<(ID3D12Resource, u64, u64)> {
     let (section, offset) = {
         let v = views();
